@@ -1,0 +1,823 @@
+<!DOCTYPE html>
+<html lang="fa">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<title>Body Puppet Battle</title>
+<style>
+  html, body {
+    margin: 0; padding: 0; width: 100%; height: 100%;
+    background: #000; overflow: hidden; touch-action: none;
+    font-family: -apple-system, "Segoe UI", Tahoma, sans-serif;
+    -webkit-user-select: none; user-select: none;
+  }
+  #video { position: absolute; width: 1px; height: 1px; opacity: 0; }
+  #canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; background:#fff; }
+
+  .overlay {
+    position: absolute; inset: 0;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    background: rgba(255,255,255,0.96); color:#111; text-align:center; gap: 14px;
+    z-index: 5; padding: 20px; box-sizing: border-box;
+  }
+  .hidden { display: none !important; }
+
+  h1 { font-size: 8vw; margin: 0 0 10px 0; letter-spacing: 2px; }
+  h2 { font-size: 6vw; margin: 0; }
+
+  button.big {
+    font-size: 5vw; padding: 14px 34px; border-radius: 14px; border: 3px solid #111;
+    background: #fff; color:#111; min-width: 60vw; font-weight: bold;
+  }
+  button.big:active { background:#111; color:#fff; }
+
+  #hud {
+    position: absolute; top: 0; left: 0; right: 0; z-index: 4;
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 10px 14px; box-sizing: border-box; pointer-events: none;
+  }
+  #hud button {
+    pointer-events: all; font-size: 3.6vw; padding: 8px 16px; border-radius: 10px;
+    border: 2px solid #111; background: rgba(255,255,255,0.85); font-weight: bold;
+  }
+  #status { font-size: 3.6vw; color:#555; max-width: 90vw; }
+  #hint { position:absolute; bottom: 14px; left:0; right:0; text-align:center;
+    color:#333; font-size: 3.2vw; z-index:4; pointer-events:none; }
+  #debug { position:absolute; top:44px; left:10px; z-index:4; color:#900; font-size:3vw;
+    background:rgba(255,255,255,0.7); padding:2px 8px; border-radius:6px; pointer-events:none; }
+</style>
+</head>
+<body>
+
+<video id="video" playsinline autoplay muted></video>
+<canvas id="canvas"></canvas>
+
+<div id="menu" class="overlay">
+  <h1>BODY PUPPET</h1>
+  <button class="big" id="btnSimple">SIMPLE</button>
+  <button class="big" id="btnBattle">BATTLE</button>
+  <button class="big" id="btnMirror">آینه: روشن</button>
+  <p id="status">در حال بارگذاری دوربین و هوش مصنوعی...</p>
+</div>
+
+<div id="hud" class="hidden">
+  <button id="btnMenuTop">MENU</button>
+  <div></div>
+</div>
+<div id="hint" class="hidden">دستت را سریع حرکت بده تا مشت بزنی</div>
+<div id="debug" class="hidden"></div>
+
+<div id="endScreen" class="overlay hidden">
+  <h2 id="endText"></h2>
+  <button class="big" id="btnRestart">RESTART</button>
+  <button class="big" id="btnMenu2">MENU</button>
+</div>
+
+<script type="module">
+import { PoseLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/+esm";
+
+// ============================================================
+//  SETTINGS
+// ============================================================
+let MIRROR = true;
+
+const VISIBILITY = 0.30;
+const BODY_SMOOTH = 0.55;
+
+const GROUND_RATIO = 0.80;
+const PUPPET_TORSO_TARGET = 190;   // desired shoulder-hip pixel length (pre-scale) -> puppet size
+const SCALE_SMOOTH = 0.15;
+const MIN_SCALE_FACTOR = 0.4, MAX_SCALE_FACTOR = 3.0;
+
+// Literal left/right mirroring: the puppet's on-screen X position directly follows the
+// player's real position in the camera frame (mirrored). Moving right in real life = moving
+// right on screen = walking toward the enemy, since the arena is left/right only.
+const LATERAL_AMPLIFY = 1.8;        // how much a real step is amplified into game movement
+const ARENA_START_RATIO = 0.30;     // where the player starts (relative to screen width)
+const ARENA_MIN_RATIO = 0.06;
+const ARENA_MAX_RATIO = 0.85;
+const ANCHOR_SMOOTH = 0.22;         // smoothing for the on-screen walk motion
+const CALIBRATION_FRAMES = 15;      // frames used to learn the player's neutral standing spot
+const LOCK_JUMP_THRESHOLD = 260;    // px (pre-scale): a bigger single-frame jump than this is
+                                     // treated as "not the same person" and rejected (lock-on)
+
+const HEAD_LANDMARK = 0;
+const HEAD_HIT_RANGE = 95;          // px (pre-scale) around the head that counts as a headshot
+const HEAD_DAMAGE_MULT = 1.5;
+const HEAD_KICK_DURATION = 0.25;    // seconds the head snaps sideways on a hit
+const IMPACT_POINTS = [15,16,25,26,27,28,0]; // wrists, knees, ankles, head - any can land a hit
+
+const PLAYER_MAX_HP = 100;
+const ENEMY_MAX_HP = 100;
+const PUNCH_DAMAGE = 22;
+const PUNCH_RANGE = 130;
+const PUNCH_SPEED_THRESHOLD = 1100;   // px/sec (pre-scale) to register a punch
+const PUNCH_KNOCKDOWN_SPEED = 2100;   // px/sec for a guaranteed knockdown feel
+const PUNCH_COOLDOWN = 0.30;          // seconds
+const PUNCH_HISTORY_WINDOW = 0.16;    // seconds of wrist history used for speed calc
+
+const MELEE_DISTANCE = 240;           // px (pre-scale), how close enemy stops from player
+const ENEMY_WALK_SPEED = 110;         // px/sec
+const ENEMY_DAMAGE = 9;
+const ENEMY_ATTACK_COOLDOWN = 1.1;    // seconds between enemy attacks
+const ENEMY_ATTACK_DURATION = 0.5;    // seconds for windup+punch+retract
+const ENEMY_COUNT = 3;
+const ENEMY_SPAWN_DELAY = 0.8;        // seconds after one dies before next appears
+
+const FALL_DURATION = 0.45;
+const GETUP_DURATION = 0.55;
+const KNOCKDOWN_STAGGER = 0.9;        // seconds an enemy stays down on a non-lethal knockdown
+
+const BLACK = "#000000", RED = "#e00000", GREEN = "#00d200";
+
+const BODY_CONNECTIONS = [
+  [11,12],[11,13],[13,15],[12,14],[14,16],
+  [11,23],[12,24],[23,24],
+  [23,25],[25,27],[27,29],[29,31],
+  [24,26],[26,28],[28,30],[30,32]
+];
+
+// ============================================================
+//  DOM / CANVAS SETUP
+// ============================================================
+const video = document.getElementById("video");
+const canvas = document.getElementById("canvas");
+const ctx = canvas.getContext("2d");
+const statusEl = document.getElementById("status");
+const menuEl = document.getElementById("menu");
+const hudEl = document.getElementById("hud");
+const hintEl = document.getElementById("hint");
+const debugEl = document.getElementById("debug");
+const endEl = document.getElementById("endScreen");
+const endText = document.getElementById("endText");
+
+let LW = 0, LH = 0, SCALE = 1, GROUND_Y = 0, ANCHOR_X = 0;
+function resize() {
+  LW = canvas.width = window.innerWidth * devicePixelRatio;
+  LH = canvas.height = window.innerHeight * devicePixelRatio;
+  canvas.style.width = window.innerWidth + "px";
+  canvas.style.height = window.innerHeight + "px";
+  SCALE = LH / 900;
+  GROUND_Y = LH * GROUND_RATIO;
+  ANCHOR_X = LW * ARENA_START_RATIO;
+}
+window.addEventListener("resize", resize);
+resize();
+
+let mode = "menu"; // menu | simple | battle
+let poseLandmarker = null;
+let bodyPrev = {};
+let playerScaleSmooth = null;
+let lastTime = performance.now();
+let neutralX = null;
+let calibrationCount = 0;
+let anchorXDynamic = null;
+let lockedHipRefX = null;      // last accepted hip x, used to detect "different person" jumps
+let lastGoodFinalPts = null;   // frozen puppet shown when tracking is lost
+let lastGoodRawPts = null;
+let impactHistory = {};        // per-landmark speed history for punches/kicks/headbutts
+
+// ============================================================
+//  HELPERS
+// ============================================================
+function mid(a,b){ return [(a[0]+b[0])/2, (a[1]+b[1])/2]; }
+function dist(a,b){ return Math.hypot(a[0]-b[0], a[1]-b[1]); }
+function clamp(v,lo,hi){ return Math.max(lo, Math.min(hi, v)); }
+function smoothPoint(prev, cur, amount) {
+  if (!prev) return cur;
+  return [prev[0] + (cur[0]-prev[0])*amount, prev[1] + (cur[1]-prev[1])*amount];
+}
+function lerp(a,b,t){ return a+(b-a)*t; }
+function rotateAround(pt, pivot, angle) {
+  const s = Math.sin(angle), c = Math.cos(angle);
+  const x = pt[0]-pivot[0], y = pt[1]-pivot[1];
+  return [pivot[0] + x*c - y*s, pivot[1] + x*s + y*c];
+}
+
+async function initCamera() {
+  const stream = await navigator.mediaDevices.getUserMedia({
+    video: { facingMode: "user", width: { ideal: 640 }, height: { ideal: 480 } },
+    audio: false
+  });
+  video.srcObject = stream;
+  await new Promise(res => { video.onloadedmetadata = () => { video.play(); res(); }; });
+}
+
+async function initPose() {
+  const filesetResolver = await FilesetResolver.forVisionTasks(
+    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
+  );
+  poseLandmarker = await PoseLandmarker.createFromOptions(filesetResolver, {
+    baseOptions: {
+      modelAssetPath: "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task",
+      delegate: "GPU"
+    },
+    runningMode: "VIDEO",
+    numPoses: 1
+  });
+}
+
+// ============================================================
+//  RAW POSE -> SCREEN POINTS (mirror + smoothing only)
+// ============================================================
+function getPosePoints(landmarks) {
+  const out = {};
+  if (!landmarks) return out;
+  for (let i = 0; i < landmarks.length; i++) {
+    const lm = landmarks[i];
+    if ((lm.visibility ?? 1) >= VISIBILITY) {
+      let x = lm.x;
+      if (MIRROR) x = 1 - x;
+      const px = x * LW, py = lm.y * LH;
+      const sp = smoothPoint(bodyPrev[i], [px, py], BODY_SMOOTH);
+      bodyPrev[i] = sp;
+      out[i] = sp;
+    }
+  }
+  return out;
+}
+
+// ============================================================
+//  PLAYER PUPPET: normalize + anchor to ground on the left
+// ============================================================
+function buildPlayerPuppet(p) {
+  // Lost tracking this frame -> freeze on the last known pose instead of vanishing.
+  if (!p[11] || !p[12] || !p[23] || !p[24]) return lastGoodFinalPts;
+
+  const shoulderMid = mid(p[11], p[12]);
+  const hipMid = mid(p[23], p[24]);
+
+  // Lock-on: once we've found a body, reject sudden teleports (a different person walking
+  // into frame, or a bad detection) so we don't snap onto someone else.
+  if (lockedHipRefX !== null && Math.abs(hipMid[0] - lockedHipRefX) > LOCK_JUMP_THRESHOLD*SCALE) {
+    return lastGoodFinalPts;
+  }
+  lockedHipRefX = hipMid[0];
+
+  const torsoLen = dist(shoulderMid, hipMid) || 1;
+  const targetTorso = PUPPET_TORSO_TARGET * SCALE;
+  let scaleFactor = clamp(targetTorso / torsoLen, MIN_SCALE_FACTOR, MAX_SCALE_FACTOR);
+  playerScaleSmooth = playerScaleSmooth == null ? scaleFactor
+    : playerScaleSmooth + (scaleFactor - playerScaleSmooth) * SCALE_SMOOTH;
+  const sf = playerScaleSmooth;
+
+  // Calibrate the player's neutral standing spot during the first frames of a round.
+  if (neutralX == null) {
+    neutralX = hipMid[0];
+    calibrationCount = 1;
+  } else if (calibrationCount < CALIBRATION_FRAMES) {
+    neutralX = neutralX + (hipMid[0] - neutralX) * 0.3;
+    calibrationCount++;
+  }
+
+  // Literal mirroring: real position relative to your own starting spot maps directly
+  // to game position (amplified a bit so the whole arena is reachable).
+  const lateralOffset = (hipMid[0] - neutralX) * LATERAL_AMPLIFY;
+  const targetAnchorX = clamp(ANCHOR_X + lateralOffset, ARENA_MIN_RATIO*LW, ARENA_MAX_RATIO*LW);
+  anchorXDynamic = anchorXDynamic == null ? targetAnchorX
+    : anchorXDynamic + (targetAnchorX - anchorXDynamic) * ANCHOR_SMOOTH;
+  const ax = anchorXDynamic;
+
+  const local = {};
+  let maxY = -Infinity;
+  for (const i in p) {
+    const dx = (p[i][0] - hipMid[0]) * sf;
+    const dy = (p[i][1] - hipMid[1]) * sf;
+    local[i] = [dx, dy];
+    if (dy > maxY) maxY = dy;
+  }
+  const translateY = GROUND_Y - maxY;
+  const final = {};
+  for (const i in local) {
+    final[i] = [ax + local[i][0], translateY + local[i][1]];
+  }
+  final.__hip = [ax, translateY];
+  final.__chest = final[11] && final[12] ? mid(final[11], final[12]) : [ax, translateY - 90*SCALE];
+  lastGoodFinalPts = final;
+  return final;
+}
+
+function drawGround() {
+  ctx.strokeStyle = BLACK;
+  ctx.lineWidth = 4 * SCALE;
+  ctx.beginPath();
+  ctx.moveTo(0, GROUND_Y);
+  ctx.lineTo(LW, GROUND_Y);
+  ctx.stroke();
+}
+
+function drawPuppetPoints(q, thickness=6, jointR=5) {
+  ctx.strokeStyle = BLACK;
+  ctx.lineWidth = thickness*SCALE;
+  ctx.lineCap = "round";
+  for (const [a,b] of BODY_CONNECTIONS) {
+    if (q[a] && q[b]) {
+      ctx.beginPath();
+      ctx.moveTo(q[a][0], q[a][1]);
+      ctx.lineTo(q[b][0], q[b][1]);
+      ctx.stroke();
+    }
+  }
+  ctx.fillStyle = RED;
+  for (const key in q) {
+    if (key.startsWith("__")) continue;
+    ctx.beginPath();
+    ctx.arc(q[key][0], q[key][1], jointR*SCALE, 0, Math.PI*2);
+    ctx.fill();
+  }
+}
+
+function drawHP(x, y, hp, maxHp, label, width=150) {
+  width *= SCALE;
+  hp = clamp(hp, 0, maxHp);
+  const ratio = maxHp ? hp/maxHp : 0;
+  ctx.strokeStyle = BLACK; ctx.lineWidth = 2;
+  ctx.strokeRect(x, y, width, 14*SCALE);
+  ctx.fillStyle = ratio > 0.35 ? GREEN : RED;
+  ctx.fillRect(x+2, y+2, (width-4)*ratio, 10*SCALE);
+  ctx.fillStyle = BLACK;
+  ctx.font = `${13*SCALE}px sans-serif`;
+  ctx.fillText(label, x, y - 6*SCALE);
+}
+
+function getImpactPoints(finalPts) {
+  const out = [];
+  for (const id of IMPACT_POINTS) {
+    if (finalPts[id]) out.push({ id, pos: finalPts[id] });
+  }
+  return out;
+}
+
+// ============================================================
+//  ENEMY (procedural stick figure, feet at local y=0 = ground)
+// ============================================================
+class Enemy {
+  constructor(x, hpMul=1) {
+    this.x = x;
+    this.hp = ENEMY_MAX_HP * hpMul;
+    this.state = "walking";     // walking | engage | attacking | knockdown | falling | dead
+    this.attackTimer = 0;
+    this.attackHasHit = false;
+    this.attackCooldown = 0;
+    this.attackTargetsHead = false;
+    this.knockdownTimer = 0;
+    this.fallAngle = 0;
+    this.willDieOnFall = false;
+    this.bobPhase = Math.random()*Math.PI*2;
+    this.walkPhase = 0;
+    this.hitFlashT = 0;
+    this.headKickT = 0;
+    this.headKickDir = 1;
+  }
+
+  targetX(playerAnchorX) { return playerAnchorX + MELEE_DISTANCE*SCALE; }
+
+  takeHit(damage, knockdown, isHead, fromX) {
+    if (this.state === "falling" || this.state === "dead") return;
+    this.hp -= damage;
+    this.hitFlashT = 0.15;
+    if (isHead) {
+      this.headKickT = HEAD_KICK_DURATION;
+      this.headKickDir = (fromX !== undefined && fromX < this.x) ? 1 : -1;
+      knockdown = true; // a real headshot always drops them
+    }
+    this.willDieOnFall = this.hp <= 0;
+    if (this.willDieOnFall || knockdown) {
+      this.state = "falling";
+      this.fallAngle = 0;
+      this.knockdownTimer = 0;
+    }
+  }
+
+  update(dt, playerAnchorX) {
+    this.hitFlashT = Math.max(0, this.hitFlashT - dt);
+    this.headKickT = Math.max(0, this.headKickT - dt);
+    const tx = this.targetX(playerAnchorX);
+
+    if (this.state === "walking") {
+      this.walkPhase += dt*7;
+      const diff = this.x - tx;
+      if (Math.abs(diff) > 4*SCALE) {
+        const step = ENEMY_WALK_SPEED*SCALE*dt;
+        this.x += diff > 0 ? -Math.min(step, diff) : Math.min(step, -diff);
+      } else {
+        this.state = "engage";
+        this.attackCooldown = ENEMY_ATTACK_COOLDOWN*0.4;
+      }
+      return 0;
+    }
+
+    if (this.state === "engage") {
+      this.walkPhase += dt*2;
+      // keep respecting the player's live position: back off or close in if they move
+      const diff = this.x - tx;
+      if (Math.abs(diff) > 6*SCALE) {
+        const step = ENEMY_WALK_SPEED*SCALE*dt*0.8;
+        this.x += diff > 0 ? -Math.min(step, diff) : Math.min(step, -diff);
+      }
+      this.attackCooldown -= dt;
+      if (this.attackCooldown <= 0) {
+        this.state = "attacking";
+        this.attackTimer = 0;
+        this.attackHasHit = false;
+        this.attackTargetsHead = Math.random() < 0.3;
+      }
+      return 0;
+    }
+
+    if (this.state === "attacking") {
+      this.attackTimer += dt;
+      const t = this.attackTimer / ENEMY_ATTACK_DURATION;
+      let dmg = 0;
+      if (t >= 0.45 && t <= 0.6 && !this.attackHasHit) {
+        this.attackHasHit = true;
+        dmg = this.attackTargetsHead ? ENEMY_DAMAGE*HEAD_DAMAGE_MULT : ENEMY_DAMAGE;
+      }
+      if (t >= 1) {
+        this.state = "engage";
+        this.attackCooldown = ENEMY_ATTACK_COOLDOWN;
+      }
+      return dmg;
+    }
+
+    if (this.state === "falling") {
+      this.fallAngle = Math.min(Math.PI/2, this.fallAngle + dt*(Math.PI/2/FALL_DURATION));
+      if (this.fallAngle >= Math.PI/2) {
+        if (this.willDieOnFall) {
+          this.state = "dead";
+        } else {
+          this.state = "knockdown";
+          this.knockdownTimer = 0;
+        }
+      }
+      return 0;
+    }
+
+    if (this.state === "knockdown") {
+      this.knockdownTimer += dt;
+      if (this.knockdownTimer >= KNOCKDOWN_STAGGER) {
+        this.state = "gettingUp";
+        this.fallAngle = Math.PI/2;
+      }
+      return 0;
+    }
+
+    if (this.state === "gettingUp") {
+      this.fallAngle = Math.max(0, this.fallAngle - dt*(Math.PI/2/GETUP_DURATION));
+      if (this.fallAngle <= 0) {
+        this.state = "walking";
+      }
+      return 0;
+    }
+
+    return 0;
+  }
+
+  chestPoint() {
+    const s = 0.55*SCALE;
+    return [this.x, GROUND_Y - 95*s];
+  }
+
+  headPoint() {
+    const s = 0.55*SCALE;
+    return [this.x + this.headKickDir*(this.headKickT/HEAD_KICK_DURATION)*30*s, GROUND_Y - 140*s];
+  }
+
+  draw() {
+    const s = 0.55*SCALE;
+    let bob = 0, armSwing = 0, legSwing = 0, punchExtend = 0;
+
+    if (this.state === "walking") {
+      bob = Math.sin(this.walkPhase*2)*3*s;
+      legSwing = Math.sin(this.walkPhase)*14*s;
+      armSwing = -Math.sin(this.walkPhase)*10*s;
+    } else if (this.state === "engage") {
+      bob = Math.sin(this.bobPhase + performance.now()/300)*3*s;
+    } else if (this.state === "attacking") {
+      const t = this.attackTimer/ENEMY_ATTACK_DURATION;
+      // windup (0-0.35) pull back, thrust (0.35-0.6) extend, retract (0.6-1)
+      if (t < 0.35) punchExtend = lerp(0, -8, t/0.35);
+      else if (t < 0.6) punchExtend = lerp(-8, 38, (t-0.35)/0.25);
+      else punchExtend = lerp(38, 0, (t-0.6)/0.4);
+      punchExtend *= s;
+    }
+
+    const neck=[0,-118*s+bob], chest=[0,-95*s+bob], hip=[0,-70*s];
+    const shL=[-32*s,-100*s+bob], shR=[32*s,-100*s+bob];
+    const elL=[-52*s+armSwing,-75*s+bob], elR=[52*s-armSwing,-75*s+bob];
+    // front (left-reaching) arm is the punching arm since player is to the left
+    const wrL=[-62*s+armSwing-punchExtend, -50*s+bob];
+    const wrR=[62*s-armSwing, -50*s+bob];
+    const knL=[-18*s+legSwing,-35*s], knR=[18*s-legSwing,-35*s];
+    const ftL=[-24*s+legSwing*1.4,0], ftR=[24*s-legSwing*1.4,0];
+    const headKick = this.headKickDir * (this.headKickT/HEAD_KICK_DURATION) * 34*s;
+    const headC=[headKick,-140*s+bob];
+
+    let pts = {neck,chest,hip,shL,shR,elL,elR,wrL,wrR,knL,knR,ftL,ftR,headC};
+
+    ctx.save();
+    ctx.translate(this.x, GROUND_Y);
+    if (this.state === "falling" || this.state === "knockdown" || this.state === "gettingUp") {
+      ctx.rotate(this.fallAngle);
+    }
+
+    const lines = [[neck,chest],[chest,shL],[shL,elL],[elL,wrL],
+      [chest,shR],[shR,elR],[elR,wrR],
+      [chest,hip],[hip,knL],[knL,ftL],[hip,knR],[knR,ftR],[neck,headC]];
+    ctx.strokeStyle = BLACK; ctx.lineWidth = Math.max(4, 6*0.8)*SCALE; ctx.lineCap="round";
+    for (const [a,b] of lines) {
+      ctx.beginPath(); ctx.moveTo(a[0],a[1]); ctx.lineTo(b[0],b[1]); ctx.stroke();
+    }
+    ctx.beginPath(); ctx.arc(headC[0],headC[1], Math.max(8,18*s), 0, Math.PI*2); ctx.stroke();
+
+    ctx.fillStyle = this.hitFlashT > 0 ? RED : "#c00000";
+    for (const key of ["neck","chest","shL","shR","elL","elR","wrL","wrR","hip","knL","knR","ftL","ftR"]) {
+      const p = pts[key];
+      ctx.beginPath(); ctx.arc(p[0],p[1], Math.max(3,4*SCALE), 0, Math.PI*2); ctx.fill();
+    }
+    ctx.restore();
+
+    if (this.state !== "dead" && this.state !== "falling") {
+      drawHP(this.x-75*SCALE, GROUND_Y-140*s-30*SCALE, this.hp, ENEMY_MAX_HP, "ENEMY", 150);
+    }
+  }
+}
+
+// ============================================================
+//  GAME STATE
+// ============================================================
+let enemies = [];
+let defeatedCount = 0;
+let playerHP = PLAYER_MAX_HP;
+let gameOver = false;
+let gameWon = false;
+let spawnTimer = 0;
+let lastPunchTime = 0;
+let punchFlashUntil = 0;
+let playerAnim = { state: "idle", timer: 0, snapshot: null };
+// idle | falling | knockdown | gettingUp
+
+function resetRound() {
+  bodyPrev = {};
+  playerScaleSmooth = null;
+  neutralX = null;
+  calibrationCount = 0;
+  anchorXDynamic = null;
+  lockedHipRefX = null;
+  lastGoodFinalPts = null;
+  lastGoodRawPts = null;
+  impactHistory = {};
+  enemies = [ new Enemy(LW + 120*SCALE) ];
+  defeatedCount = 0;
+  spawnTimer = 0;
+  playerHP = PLAYER_MAX_HP;
+  gameOver = false;
+  gameWon = false;
+  lastPunchTime = 0;
+  punchFlashUntil = 0;
+  playerAnim = { state: "idle", timer: 0, snapshot: null };
+  endEl.classList.add("hidden");
+}
+
+function triggerPlayerFall(finalPts, isHead) {
+  if (playerAnim.state !== "idle") return;
+  playerAnim.state = "falling";
+  playerAnim.timer = 0;
+  playerAnim.snapshot = finalPts;
+  playerAnim.isHead = !!isHead;
+}
+
+function drawFallingPlayer(finalPts, angle, timer, isHead) {
+  const hip = finalPts.__hip;
+  const q = {};
+  for (const key in finalPts) {
+    if (key.startsWith("__")) continue;
+    q[key] = finalPts[key];
+  }
+  // quick head snap on a headshot, before the whole body collapses
+  if (isHead && q[0] && timer < HEAD_KICK_DURATION) {
+    const k = (1 - timer/HEAD_KICK_DURATION) * 40*SCALE;
+    q[0] = [q[0][0] - k, q[0][1]];
+  }
+  for (const key in q) q[key] = rotateAround(q[key], hip, angle);
+  drawPuppetPoints(q);
+}
+
+// ============================================================
+//  MAIN LOOP
+// ============================================================
+function loop() {
+  requestAnimationFrame(loop);
+  if (!poseLandmarker || video.readyState < 2) return;
+
+  const now = performance.now();
+  let dt = (now - lastTime) / 1000;
+  dt = clamp(dt, 0, 0.06);
+  lastTime = now;
+
+  const result = poseLandmarker.detectForVideo(video, now);
+  const landmarks = result.landmarks && result.landmarks[0];
+  const rawPts = getPosePoints(landmarks);
+
+  ctx.fillStyle = "#ffffff";
+  ctx.fillRect(0,0,LW,LH);
+  drawGround();
+
+  if (mode === "simple") {
+    if (Object.keys(rawPts).length) lastGoodRawPts = rawPts;
+    const q = { ...(lastGoodRawPts || {}) };
+    drawPuppetPoints(q);
+    if (!lastGoodRawPts) {
+      ctx.fillStyle = "#900";
+      ctx.font = `${20*SCALE}px sans-serif`;
+      ctx.fillText("بدن شناسایی نشد", 20, 40*SCALE);
+    }
+    return;
+  }
+
+  if (mode !== "battle") return;
+
+  // ---- Player puppet (idle) or canned fall animation ----
+  let finalPts = null;
+  if (playerAnim.state === "idle") {
+    finalPts = buildPlayerPuppet(rawPts);
+    if (finalPts) {
+      drawPuppetPoints(finalPts);
+      drawHP(finalPts.__hip[0]-75*SCALE, GROUND_Y-260*SCALE, playerHP, PLAYER_MAX_HP, "PLAYER HP", 150);
+    } else {
+      ctx.fillStyle = "#900";
+      ctx.font = `${20*SCALE}px sans-serif`;
+      ctx.fillText("کل بدنت رو جلوی دوربین نشون بده", 20, 40*SCALE);
+    }
+  } else {
+    playerAnim.timer += dt;
+    let angle;
+    if (playerAnim.state === "falling") {
+      angle = clamp(playerAnim.timer/FALL_DURATION, 0, 1) * (Math.PI/2);
+      if (playerAnim.timer >= FALL_DURATION) { playerAnim.state = "knockdown"; playerAnim.timer = 0; }
+    } else if (playerAnim.state === "knockdown") {
+      angle = Math.PI/2;
+      if (playerAnim.timer >= 0.6) { playerAnim.state = "gettingUp"; playerAnim.timer = 0; }
+    } else { // gettingUp
+      angle = (Math.PI/2) * (1 - clamp(playerAnim.timer/GETUP_DURATION, 0, 1));
+      if (playerAnim.timer >= GETUP_DURATION) { playerAnim.state = "idle"; playerAnim.snapshot = null; }
+    }
+    if (playerAnim.snapshot) drawFallingPlayer(playerAnim.snapshot, angle, playerAnim.timer, playerAnim.isHead);
+    const hipX = playerAnim.snapshot ? playerAnim.snapshot.__hip[0] : (anchorXDynamic ?? ANCHOR_X);
+    drawHP(hipX-75*SCALE, GROUND_Y-260*SCALE, playerHP, PLAYER_MAX_HP, "PLAYER HP", 150);
+  }
+
+  if (gameOver || gameWon) {
+    for (const e of enemies) e.draw();
+    return;
+  }
+
+  // ---- Hit detection: any joint (fist, foot, knee, head) can land a real hit ----
+  if (finalPts && playerAnim.state === "idle") {
+    const points = getImpactPoints(finalPts);
+    const nowS = now/1000;
+    let bestCandidate = null; // {speed, pos, targetEnemy, isHead}
+
+    for (const pt of points) {
+      let hist = impactHistory[pt.id];
+      if (!hist) hist = impactHistory[pt.id] = [];
+      hist.push({ x: pt.pos[0], y: pt.pos[1], t: now });
+      while (hist.length && (now - hist[0].t)/1000 > PUNCH_HISTORY_WINDOW) hist.shift();
+      if (hist.length < 2) continue;
+      const first = hist[0], last = hist[hist.length-1];
+      const span = (last.t - first.t)/1000;
+      if (span <= 0.02) continue;
+      const speed = dist([first.x,first.y],[last.x,last.y]) / span;
+      if (speed < PUNCH_SPEED_THRESHOLD*SCALE) continue;
+
+      const alive = enemies.filter(e => e.state !== "dead");
+      if (!alive.length) continue;
+      let target = alive[0], bestD = dist(pt.pos, target.chestPoint());
+      for (const e of alive) {
+        const d = dist(pt.pos, e.chestPoint());
+        if (d < bestD) { bestD = d; target = e; }
+      }
+      const dHead = dist(pt.pos, target.headPoint());
+      const isHead = dHead <= HEAD_HIT_RANGE*SCALE;
+      const inRange = isHead || bestD <= PUNCH_RANGE*SCALE;
+      if (!inRange) continue;
+
+      if (!bestCandidate || speed > bestCandidate.speed) {
+        bestCandidate = { speed, pos: pt.pos, target, isHead };
+      }
+    }
+
+    if (bestCandidate && nowS - lastPunchTime >= PUNCH_COOLDOWN) {
+      lastPunchTime = nowS;
+      punchFlashUntil = nowS + 0.35;
+      const power = clamp(bestCandidate.speed/(PUNCH_SPEED_THRESHOLD*SCALE), 1, 2.5);
+      let damage = PUNCH_DAMAGE*power;
+      if (bestCandidate.isHead) damage *= HEAD_DAMAGE_MULT;
+      const knockdown = bestCandidate.speed >= PUNCH_KNOCKDOWN_SPEED*SCALE;
+      bestCandidate.target.takeHit(damage, knockdown, bestCandidate.isHead, bestCandidate.pos[0]);
+      impactHistory = {};
+    }
+  }
+
+  const livePlayerX = anchorXDynamic ?? ANCHOR_X;
+
+  if (punchFlashUntil > now/1000) {
+    ctx.fillStyle = RED;
+    ctx.font = `bold ${26*SCALE}px sans-serif`;
+    ctx.fillText("PUNCH!", livePlayerX-45*SCALE, GROUND_Y-280*SCALE);
+  }
+
+  // ---- Enemies update/draw ----
+  const playerChestX = livePlayerX;
+  let incomingDamage = 0;
+  let incomingIsHead = false;
+  for (const e of enemies) {
+    const dmg = e.update(dt, playerChestX);
+    if (dmg > 0) {
+      incomingDamage += dmg;
+      if (e.attackTargetsHead) incomingIsHead = true;
+    }
+    e.draw();
+  }
+
+  if (incomingDamage > 0 && playerAnim.state === "idle") {
+    playerHP -= incomingDamage;
+    if (finalPts) triggerPlayerFall(finalPts, incomingIsHead);
+  }
+
+  // remove dead enemies, count them, spawn next after delay
+  const stillAlive = [];
+  for (const e of enemies) {
+    if (e.state === "dead") {
+      defeatedCount++;
+    } else {
+      stillAlive.push(e);
+    }
+  }
+  enemies = stillAlive;
+
+  if (enemies.length === 0 && defeatedCount < ENEMY_COUNT) {
+    spawnTimer += dt;
+    if (spawnTimer >= ENEMY_SPAWN_DELAY) {
+      spawnTimer = 0;
+      enemies.push(new Enemy(LW + 120*SCALE));
+    }
+  }
+
+  if (playerHP <= 0 && !gameOver) {
+    playerHP = 0; gameOver = true;
+    endText.textContent = "GAME OVER";
+    endEl.classList.remove("hidden");
+  }
+  if (defeatedCount >= ENEMY_COUNT && enemies.length === 0 && !gameWon && !gameOver) {
+    gameWon = true;
+    endText.textContent = "YOU WIN!";
+    endEl.classList.remove("hidden");
+  }
+}
+
+// ============================================================
+//  UI WIRING
+// ============================================================
+function showMode(m) {
+  mode = m;
+  resetRound();
+  menuEl.classList.add("hidden");
+  hudEl.classList.remove("hidden");
+  hintEl.classList.toggle("hidden", m !== "battle");
+}
+
+document.getElementById("btnSimple").onclick = () => showMode("simple");
+document.getElementById("btnBattle").onclick = () => showMode("battle");
+document.getElementById("btnMenuTop").onclick = () => {
+  mode = "menu";
+  hudEl.classList.add("hidden");
+  hintEl.classList.add("hidden");
+  endEl.classList.add("hidden");
+  menuEl.classList.remove("hidden");
+};
+document.getElementById("btnMenu2").onclick = () => document.getElementById("btnMenuTop").onclick();
+document.getElementById("btnRestart").onclick = () => resetRound();
+document.getElementById("btnMirror").onclick = (e) => {
+  MIRROR = !MIRROR;
+  e.target.textContent = "آینه: " + (MIRROR ? "روشن" : "خاموش");
+  bodyPrev = {};
+};
+
+(async () => {
+  try {
+    statusEl.textContent = "در حال درخواست دسترسی دوربین...";
+    await initCamera();
+    statusEl.textContent = "در حال بارگذاری مدل هوش مصنوعی...";
+    await initPose();
+    statusEl.textContent = "آماده! یک حالت را انتخاب کن.";
+    lastTime = performance.now();
+    loop();
+  } catch (err) {
+    statusEl.textContent = "خطا: " + err.message + " (دسترسی دوربین را بررسی کن)";
+    console.error(err);
+  }
+})();
+</script>
+</body>
+</html>
