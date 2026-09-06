@@ -85,9 +85,9 @@ const VISIBILITY = 0.30;
 const BODY_SMOOTH = 0.55;
 
 const GROUND_RATIO = 0.80;
-const PUPPET_TORSO_TARGET = 16.5;  // matches enemy's shoulder-hip size (30*0.55*SCALE)
+const PUPPET_TORSO_TARGET = 25.5;   // desired shoulder-hip pixel length (pre-scale) -> puppet size
 const SCALE_SMOOTH = 0.15;
-const MIN_SCALE_FACTOR = 0.035, MAX_SCALE_FACTOR = 0.26;
+const MIN_SCALE_FACTOR = 0.054, MAX_SCALE_FACTOR = 0.40;
 
 // Literal left/right mirroring: the puppet's on-screen X position directly follows the
 // player's real position in the camera frame (mirrored). Moving right in real life = moving
@@ -111,6 +111,7 @@ const PLAYER_MAX_HP = 100;
 const ENEMY_MAX_HP = 100;
 const PUNCH_DAMAGE = 22;
 const PUNCH_RANGE = 130;
+const ENEMY_PUNCH_RANGE = 130;        // px (pre-scale) how close enemy's fist must be to actually land
 const PUNCH_SPEED_THRESHOLD = 1100;   // px/sec (pre-scale) to register a punch
 const PUNCH_KNOCKDOWN_SPEED = 2100;   // px/sec for a guaranteed knockdown feel
 const PUNCH_COOLDOWN = 0.30;          // seconds
@@ -389,7 +390,7 @@ class Enemy {
     }
   }
 
-  update(dt, playerAnchorX) {
+  update(dt, playerAnchorX, playerHitPoints) {
     this.hitFlashT = Math.max(0, this.hitFlashT - dt);
     this.headKickT = Math.max(0, this.headKickT - dt);
     const tx = this.targetX(playerAnchorX);
@@ -431,7 +432,20 @@ class Enemy {
       let dmg = 0;
       if (t >= 0.45 && t <= 0.6 && !this.attackHasHit) {
         this.attackHasHit = true;
-        dmg = this.attackTargetsHead ? ENEMY_DAMAGE*HEAD_DAMAGE_MULT : ENEMY_DAMAGE;
+        const s = 0.85*SCALE;
+        let punchExtend;
+        if (t < 0.35) punchExtend = lerp(0, -8, t/0.35);
+        else if (t < 0.6) punchExtend = lerp(-8, 38, (t-0.35)/0.25);
+        else punchExtend = lerp(38, 0, (t-0.6)/0.4);
+        punchExtend *= s;
+        const fistPos = [this.x - 62*s - punchExtend, GROUND_Y - 50*s];
+        const targetPoint = (this.attackTargetsHead && playerHitPoints && playerHitPoints.head)
+          ? playerHitPoints.head
+          : (playerHitPoints && playerHitPoints.chest);
+        const reach = (this.attackTargetsHead ? HEAD_HIT_RANGE : ENEMY_PUNCH_RANGE) * SCALE;
+        if (targetPoint && dist(fistPos, targetPoint) <= reach) {
+          dmg = this.attackTargetsHead ? ENEMY_DAMAGE*HEAD_DAMAGE_MULT : ENEMY_DAMAGE;
+        }
       }
       if (t >= 1) {
         this.state = "engage";
@@ -474,17 +488,17 @@ class Enemy {
   }
 
   chestPoint() {
-    const s = 0.55*SCALE;
+    const s = 0.85*SCALE;
     return [this.x, GROUND_Y - 95*s];
   }
 
   headPoint() {
-    const s = 0.55*SCALE;
+    const s = 0.85*SCALE;
     return [this.x + this.headKickDir*(this.headKickT/HEAD_KICK_DURATION)*30*s, GROUND_Y - 140*s];
   }
 
   draw() {
-    const s = 0.55*SCALE;
+    const s = 0.85*SCALE;
     let bob = 0, armSwing = 0, legSwing = 0, punchExtend = 0;
 
     if (this.state === "walking") {
@@ -731,8 +745,9 @@ function loop() {
   const playerChestX = livePlayerX;
   let incomingDamage = 0;
   let incomingIsHead = false;
+  const playerHitPoints = finalPts ? { chest: finalPts.__chest, head: finalPts[0] || finalPts.__chest } : {};
   for (const e of enemies) {
-    const dmg = e.update(dt, playerChestX);
+    const dmg = e.update(dt, playerChestX, playerHitPoints);
     if (dmg > 0) {
       incomingDamage += dmg;
       if (e.attackTargetsHead) incomingIsHead = true;
