@@ -85,9 +85,9 @@ const VISIBILITY = 0.30;
 const BODY_SMOOTH = 0.55;
 
 const GROUND_RATIO = 0.80;
-const PUPPET_TORSO_TARGET = 190;   // desired shoulder-hip pixel length (pre-scale) -> puppet size
+const PUPPET_TORSO_TARGET = 16.5;  // matches enemy's shoulder-hip size (30*0.55*SCALE)
 const SCALE_SMOOTH = 0.15;
-const MIN_SCALE_FACTOR = 0.4, MAX_SCALE_FACTOR = 3.0;
+const MIN_SCALE_FACTOR = 0.035, MAX_SCALE_FACTOR = 0.26;
 
 // Literal left/right mirroring: the puppet's on-screen X position directly follows the
 // player's real position in the camera frame (mirrored). Moving right in real life = moving
